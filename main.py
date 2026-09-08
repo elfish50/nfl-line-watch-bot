@@ -119,6 +119,38 @@ async def cmd_games(update, context):
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_check(update, context):
+    """Manually runs the full line+bets+injuries check right now, on demand,
+    against the next upcoming game (or a named team) — no waiting for T-60/30/10."""
+    await update.message.reply_text(
+        "Running a live check — this can take ~20-30s (Playwright has to render the Cleatz page)..."
+    )
+    try:
+        events = await asyncio.to_thread(fetch_odds, config.ODDS_API_KEY)
+    except Exception as e:
+        await update.message.reply_text(f"Odds fetch failed: {e}")
+        return
+    if not events:
+        await update.message.reply_text("No upcoming NFL games found.")
+        return
+    target_team = " ".join(context.args) if context.args else None
+    ev = None
+    if target_team:
+        for e in events:
+            if target_team.lower() in e["away_team"].lower() or target_team.lower() in e["home_team"].lower():
+                ev = e
+                break
+        if ev is None:
+            await update.message.reply_text(f"No upcoming game matching '{target_team}' found.")
+            return
+    else:
+        ev = events[0]
+    try:
+        await check_game(context.bot, ev, "manual /check")
+    except Exception as e:
+        await update.message.reply_text(f"Check failed: {e}")
+
+
 async def post_init(app):
     scheduler.start()
     await refresh_schedule(app)
@@ -127,9 +159,18 @@ async def post_init(app):
 
 
 def main():
-    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    token = config.TELEGRAM_BOT_TOKEN
+    print(f"[startup] TELEGRAM_BOT_TOKEN present: {bool(token)}, length: {len(token)}")
+    if not token:
+        raise SystemExit(
+            "TELEGRAM_BOT_TOKEN is empty. Check the Railway Variables tab on THIS service: "
+            "name must be exactly TELEGRAM_BOT_TOKEN, and this service must have redeployed "
+            "after the variable was saved."
+        )
+    app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("games", cmd_games))
+    app.add_handler(CommandHandler("check", cmd_check))
     app.run_polling()
 
 
