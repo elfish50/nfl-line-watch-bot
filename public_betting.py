@@ -5,6 +5,9 @@ CLEATZ_URL = "https://cleatz.com/public-betting/nfl/"
 
 # Matches a game header like: "NE Patriots@SEA Seahawks" followed by
 # "Wed, Sep 9 · 8:20 pm ET" on the next line.
+# NOTE: this is provisional — first real fetch showed the actual site uses a
+# different format ("Bears @ Panthers", spaces around @, mascot-only names),
+# so this WILL need to be rewritten once we see the real per-game board structure.
 GAME_HEADER_RE = re.compile(
     r"([A-Z]{2,3} [\w .'\-]+?)@([A-Z]{2,3} [\w .'\-]+?)\s*\n\s*"
     r"([A-Za-z]{3}, [A-Za-z]{3} \d{1,2})\s*[·\-]\s*(\d{1,2}:\d{2}\s?[ap]m)\s*ET",
@@ -36,7 +39,7 @@ async def _fetch_rendered_text():
         await page.goto(CLEATZ_URL, wait_until="networkidle", timeout=45000)
 
         try:
-            # Real game rows always contain an "@" (e.g. "NE Patriots@SEA Seahawks").
+            # Real game rows always contain an "@" (e.g. "Bears @ Panthers").
             # If this never appears, the board never actually loaded.
             await page.wait_for_function("document.body.innerText.includes('@')", timeout=15000)
         except Exception:
@@ -51,7 +54,11 @@ async def _fetch_rendered_text():
         await browser.close()
 
     print(f"[cleatz] fetched {len(text)} chars")
-    print("[cleatz] first 2000 chars:\n" + text[:2000])
+    idx = text.find("Bets")
+    if idx == -1:
+        print("[cleatz] 'Bets' never appears in the page text at all")
+    else:
+        print(f"[cleatz] context around first 'Bets' (index {idx}):\n" + text[max(0, idx - 300):idx + 1800])
     return text
 
 
