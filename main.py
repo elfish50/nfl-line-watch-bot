@@ -1,4 +1,7 @@
 import asyncio
+import http.server
+import os
+import threading
 from datetime import datetime, timedelta, timezone
 
 from telegram.ext import Application, CommandHandler
@@ -16,6 +19,23 @@ from state import load_state, save_state
 
 scheduler = AsyncIOScheduler(timezone="America/New_York")
 scheduled_keys = set()
+
+
+class _HealthHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, format, *args):
+        pass  # keep this out of the logs, it's just noise
+
+
+def _start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = http.server.HTTPServer(("0.0.0.0", port), _HealthHandler)
+    print(f"[startup] health server listening on :{port}")
+    server.serve_forever()
 
 
 def fmt_signed(n):
@@ -176,6 +196,7 @@ def main():
     app.add_handler(CommandHandler("games", cmd_games))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
+    threading.Thread(target=_start_health_server, daemon=True).start()
     app.run_polling()
 
 
