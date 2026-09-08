@@ -20,13 +20,38 @@ PAIR_RE = re.compile(
 
 async def _fetch_rendered_text():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        page = await browser.new_page()
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1366, "height": 900},
+        )
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        page = await context.new_page()
         await page.goto(CLEATZ_URL, wait_until="networkidle", timeout=45000)
+
+        try:
+            # Real game rows always contain an "@" (e.g. "NE Patriots@SEA Seahawks").
+            # If this never appears, the board never actually loaded.
+            await page.wait_for_function("document.body.innerText.includes('@')", timeout=15000)
+        except Exception:
+            print("[cleatz] '@' marker never appeared — likely bot-blocked or needs interaction")
+
+        # Nudge any lazy-loaded/virtualized content into the DOM
+        for _ in range(4):
+            await page.mouse.wheel(0, 2000)
+            await page.wait_for_timeout(500)
+
         text = await page.inner_text("body")
         await browser.close()
+
     print(f"[cleatz] fetched {len(text)} chars")
-    print("[cleatz] first 1500 chars:\n" + text[:1500])
+    print("[cleatz] first 2000 chars:\n" + text[:2000])
     return text
 
 
