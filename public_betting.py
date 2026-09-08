@@ -3,14 +3,17 @@ from playwright.async_api import async_playwright
 
 CLEATZ_URL = "https://cleatz.com/public-betting/nfl/"
 
-# PROVISIONAL — being rebuilt against the real page structure.
+# "NO Saints@DET Lions\nSUN, SEP 13 · 1:00 PM ET"
 GAME_HEADER_RE = re.compile(
     r"([A-Z]{2,3} [\w .'\-]+?)@([A-Z]{2,3} [\w .'\-]+?)\s*\n\s*"
-    r"([A-Za-z]{3}, [A-Za-z]{3} \d{1,2})\s*[·\-]\s*(\d{1,2}:\d{2}\s?[ap]m)\s*ET",
+    r"([A-Za-z]{3}, [A-Za-z]{3} \d{1,2})\s*[·\-]\s*(\d{1,2}:\d{2}\s?[AaPp][Mm])\s*ET",
 )
 
+# Just the Bets/Handle percentage pairs, in the order they appear — no attempt
+# to parse the label line, since it can carry extra badge/move text (e.g. "+30")
+# that breaks a strict single-line label match.
 PAIR_RE = re.compile(
-    r"([^\n]+?)\s*\n\s*Bets\s*\n\s*(\d{1,3})%\s*\n\s*Handle\s*\n\s*(\d{1,3})%",
+    r"Bets\s*\n\s*(\d{1,3})%\s*\n\s*Handle\s*\n\s*(\d{1,3})%",
     re.IGNORECASE,
 )
 
@@ -44,10 +47,7 @@ async def _fetch_rendered_text():
         text = await page.inner_text("body")
         await browser.close()
 
-    print(f"[cleatz] fetched {len(text)} chars — dumping in full below")
-    chunk_size = 3500
-    for i in range(0, len(text), chunk_size):
-        print(f"[cleatz] chunk {i // chunk_size}:\n" + text[i:i + chunk_size])
+    print(f"[cleatz] fetched {len(text)} chars")
     return text
 
 
@@ -61,24 +61,30 @@ def parse_public_betting(full_text):
         pairs = PAIR_RE.findall(block)
         if len(pairs) < 4:
             continue
+
+        away_label = m.group(1).strip()  # e.g. "NO Saints"
+        home_label = m.group(2).strip()  # e.g. "DET Lions"
+
         game = {
-            "away": m.group(1).strip(),
-            "home": m.group(2).strip(),
+            "away": away_label,
+            "home": home_label,
             "date_str": m.group(3).strip(),
             "time_str": m.group(4).strip(),
+            # ASSUMPTION: home listed first, away second — unverified against a
+            # game where the away team is favored. Flip if that turns out wrong.
             "spread": {
-                "side_a": pairs[0][0].strip(), "bets_a": int(pairs[0][1]), "handle_a": int(pairs[0][2]),
-                "side_b": pairs[1][0].strip(), "bets_b": int(pairs[1][1]), "handle_b": int(pairs[1][2]),
+                "side_a": home_label, "bets_a": int(pairs[0][0]), "handle_a": int(pairs[0][1]),
+                "side_b": away_label, "bets_b": int(pairs[1][0]), "handle_b": int(pairs[1][1]),
             },
             "total": {
-                "side_a": pairs[2][0].strip(), "bets_a": int(pairs[2][1]), "handle_a": int(pairs[2][2]),
-                "side_b": pairs[3][0].strip(), "bets_b": int(pairs[3][1]), "handle_b": int(pairs[3][2]),
+                "side_a": "Over", "bets_a": int(pairs[2][0]), "handle_a": int(pairs[2][1]),
+                "side_b": "Under", "bets_b": int(pairs[3][0]), "handle_b": int(pairs[3][1]),
             },
         }
         if len(pairs) >= 6:
             game["moneyline"] = {
-                "side_a": pairs[4][0].strip(), "bets_a": int(pairs[4][1]), "handle_a": int(pairs[4][2]),
-                "side_b": pairs[5][0].strip(), "bets_b": int(pairs[5][1]), "handle_b": int(pairs[5][2]),
+                "side_a": home_label, "bets_a": int(pairs[4][0]), "handle_a": int(pairs[4][1]),
+                "side_b": away_label, "bets_b": int(pairs[5][0]), "handle_b": int(pairs[5][1]),
             }
         games.append(game)
     print(f"[cleatz] parsed {len(games)} games, {len(headers)} headers matched")
