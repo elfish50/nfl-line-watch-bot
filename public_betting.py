@@ -3,18 +3,12 @@ from playwright.async_api import async_playwright
 
 CLEATZ_URL = "https://cleatz.com/public-betting/nfl/"
 
-# Matches a game header like: "NE Patriots@SEA Seahawks" followed by
-# "Wed, Sep 9 · 8:20 pm ET" on the next line.
-# NOTE: this is provisional — first real fetch showed the actual site uses a
-# different format ("Bears @ Panthers", spaces around @, mascot-only names),
-# so this WILL need to be rewritten once we see the real per-game board structure.
+# PROVISIONAL — being rebuilt against the real page structure.
 GAME_HEADER_RE = re.compile(
     r"([A-Z]{2,3} [\w .'\-]+?)@([A-Z]{2,3} [\w .'\-]+?)\s*\n\s*"
     r"([A-Za-z]{3}, [A-Za-z]{3} \d{1,2})\s*[·\-]\s*(\d{1,2}:\d{2}\s?[ap]m)\s*ET",
 )
 
-# Matches "<label line>\nBets\n<N>%\nHandle\n<N>%" — used sequentially to pull
-# out spread side A, spread side B, total over, total under, ML side A, ML side B.
 PAIR_RE = re.compile(
     r"([^\n]+?)\s*\n\s*Bets\s*\n\s*(\d{1,3})%\s*\n\s*Handle\s*\n\s*(\d{1,3})%",
     re.IGNORECASE,
@@ -39,13 +33,10 @@ async def _fetch_rendered_text():
         await page.goto(CLEATZ_URL, wait_until="networkidle", timeout=45000)
 
         try:
-            # Real game rows always contain an "@" (e.g. "Bears @ Panthers").
-            # If this never appears, the board never actually loaded.
             await page.wait_for_function("document.body.innerText.includes('@')", timeout=15000)
         except Exception:
             print("[cleatz] '@' marker never appeared — likely bot-blocked or needs interaction")
 
-        # Nudge any lazy-loaded/virtualized content into the DOM
         for _ in range(4):
             await page.mouse.wheel(0, 2000)
             await page.wait_for_timeout(500)
@@ -53,12 +44,10 @@ async def _fetch_rendered_text():
         text = await page.inner_text("body")
         await browser.close()
 
-    print(f"[cleatz] fetched {len(text)} chars")
-    idx = text.find("Bets")
-    if idx == -1:
-        print("[cleatz] 'Bets' never appears in the page text at all")
-    else:
-        print(f"[cleatz] context around first 'Bets' (index {idx}):\n" + text[max(0, idx - 300):idx + 1800])
+    print(f"[cleatz] fetched {len(text)} chars — dumping in full below")
+    chunk_size = 3500
+    for i in range(0, len(text), chunk_size):
+        print(f"[cleatz] chunk {i // chunk_size}:\n" + text[i:i + chunk_size])
     return text
 
 
@@ -71,7 +60,6 @@ def parse_public_betting(full_text):
         block = full_text[start:end]
         pairs = PAIR_RE.findall(block)
         if len(pairs) < 4:
-            # Not enough parsed to trust this game — skip rather than guess
             continue
         game = {
             "away": m.group(1).strip(),
