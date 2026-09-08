@@ -25,6 +25,8 @@ async def _fetch_rendered_text():
         await page.goto(CLEATZ_URL, wait_until="networkidle", timeout=45000)
         text = await page.inner_text("body")
         await browser.close()
+    print(f"[cleatz] fetched {len(text)} chars")
+    print("[cleatz] first 1500 chars:\n" + text[:1500])
     return text
 
 
@@ -59,6 +61,7 @@ def parse_public_betting(full_text):
                 "side_b": pairs[5][0].strip(), "bets_b": int(pairs[5][1]), "handle_b": int(pairs[5][2]),
             }
         games.append(game)
+    print(f"[cleatz] parsed {len(games)} games, {len(headers)} headers matched")
     return games
 
 
