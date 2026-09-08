@@ -106,6 +106,10 @@ async def cmd_status(update, context):
     await update.message.reply_text("Line Watch is running. Checks fire at T-60/30/10 min before each kickoff.")
 
 
+async def cmd_whoami(update, context):
+    await update.message.reply_text(f"This chat's ID is: {update.effective_chat.id}")
+
+
 async def cmd_games(update, context):
     try:
         events = await asyncio.to_thread(fetch_odds, config.ODDS_API_KEY)
@@ -171,6 +175,7 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("games", cmd_games))
     app.add_handler(CommandHandler("check", cmd_check))
+    app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.run_polling()
 
 
