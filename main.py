@@ -12,10 +12,10 @@ from apscheduler.triggers.interval import IntervalTrigger
 import config
 from odds_client import fetch_odds, consensus_for_event
 from injuries import fetch_team_injuries
-from public_betting import fetch_public_betting
-from matching import match_cleatz_game
-from signals import sharp_side
+import ppy_model
 from state import load_state, save_state
+
+CURRENT_SEASON = 2026
 
 scheduler = AsyncIOScheduler(timezone="America/New_York")
 scheduled_keys = set()
@@ -61,13 +61,6 @@ async def check_game(bot, odds_event, checkpoint_label):
     total_delta = (cur_snap["total"] - open_snap["total"]
                    if cur_snap["total"] is not None and open_snap["total"] is not None else None)
 
-    try:
-        cleatz_games = await fetch_public_betting()
-    except Exception as e:
-        print("public betting fetch failed:", e)
-        cleatz_games = []
-    match = match_cleatz_game(odds_event, cleatz_games)
-
     lines = [
         f"*{odds_event['away_team']} @ {odds_event['home_team']}* — {checkpoint_label}",
         f"Spread: {fmt_signed(consensus['spread'])}"
@@ -76,19 +69,21 @@ async def check_game(bot, odds_event, checkpoint_label):
         + (f" (moved {fmt_signed(total_delta)} since first check)" if total_delta else ""),
     ]
 
-    if match:
-        sp, tot = match["spread"], match["total"]
-        lines.append(f"Spread bets/handle — {sp['side_a']}: {sp['bets_a']}%/{sp['handle_a']}%  |  "
-                     f"{sp['side_b']}: {sp['bets_b']}%/{sp['handle_b']}%")
-        lines.append(f"Total bets/handle — {tot['side_a']}: {tot['bets_a']}%/{tot['handle_a']}%  |  "
-                     f"{tot['side_b']}: {tot['bets_b']}%/{tot['handle_b']}%")
-        sp_sharp, tot_sharp = sharp_side(sp), sharp_side(tot)
-        if sp_sharp:
-            lines.append(f"⚠️ Sharp signal (spread): {sp_sharp[0]} — {sp_sharp[1]}pp handle-over-bets gap")
-        if tot_sharp:
-            lines.append(f"⚠️ Sharp signal (total): {tot_sharp[0]} — {tot_sharp[1]}pp handle-over-bets gap")
-    else:
-        lines.append("(No public-betting match found — parser may need a fix, send me the Railway log)")
+    ppy_state = state.setdefault("ppy", {})
+    home_team, away_team = odds_event["home_team"], odds_event["away_team"]
+    try:
+        ppy_model.update_team_log(ppy_state, home_team, CURRENT_SEASON)
+        ppy_model.update_team_log(ppy_state, away_team, CURRENT_SEASON)
+        home_rating = ppy_model.compute_rating(ppy_state, home_team)
+        away_rating = ppy_model.compute_rating(ppy_state, away_team)
+        if home_rating and away_rating and consensus["spread"] is not None:
+            proj = ppy_model.project_spread(home_rating, away_rating, consensus["spread"])
+            lines.append(ppy_model.format_signal_line(proj, home_team, away_team))
+        else:
+            lines.append("(Not enough game data yet for a model projection)")
+    except Exception as e:
+        print("ppy model failed:", e)
+        lines.append("(Model projection failed — send me the Railway log)")
 
     try:
         away_inj = fetch_team_injuries(odds_event["away_team"])
@@ -146,9 +141,7 @@ async def cmd_games(update, context):
 async def cmd_check(update, context):
     """Manually runs the full line+bets+injuries check right now, on demand,
     against the next upcoming game (or a named team) — no waiting for T-60/30/10."""
-    await update.message.reply_text(
-        "Running a live check — this can take ~20-30s (Playwright has to render the Cleatz page)..."
-    )
+    await update.message.reply_text("Running a live check...")
     try:
         events = await asyncio.to_thread(fetch_odds, config.ODDS_API_KEY)
     except Exception as e:
