@@ -69,8 +69,15 @@ async def check_game(bot, odds_event, checkpoint_label):
         + (f" (moved {fmt_signed(total_delta)} since first check)" if total_delta else ""),
     ]
 
+    away_team, home_team = odds_event["away_team"], odds_event["home_team"]
+    try:
+        away_inj = fetch_team_injuries(away_team)
+        home_inj = fetch_team_injuries(home_team)
+    except Exception as e:
+        print("injury fetch failed:", e)
+        away_inj, home_inj = [], []
+
     ppy_state = state.setdefault("ppy", {})
-    home_team, away_team = odds_event["home_team"], odds_event["away_team"]
     try:
         ppy_model.update_team_log(ppy_state, home_team, CURRENT_SEASON)
         ppy_model.update_team_log(ppy_state, away_team, CURRENT_SEASON)
@@ -79,22 +86,33 @@ async def check_game(bot, odds_event, checkpoint_label):
         home_rating = ppy_model.compute_rating(ppy_state, home_team, CURRENT_SEASON)
         away_rating = ppy_model.compute_rating(ppy_state, away_team, CURRENT_SEASON)
         if home_rating and away_rating and consensus["spread"] is not None:
+            home_rating = ppy_model.apply_injury_adjustment(home_rating, home_inj)
+            away_rating = ppy_model.apply_injury_adjustment(away_rating, away_inj)
             proj = ppy_model.project_spread(home_rating, away_rating, consensus["spread"])
             lines.append(ppy_model.format_signal_line(proj, home_team, away_team))
+            if home_rating["injury_off_discount"] or home_rating["injury_def_weakness"]:
+                lines.append(f"  ↳ {home_team} injury adj: "
+                             f"off -{home_rating['injury_off_discount']*100:.0f}%, "
+                             f"def +{home_rating['injury_def_weakness']*100:.0f}%")
+            if away_rating["injury_off_discount"] or away_rating["injury_def_weakness"]:
+                lines.append(f"  ↳ {away_team} injury adj: "
+                             f"off -{away_rating['injury_off_discount']*100:.0f}%, "
+                             f"def +{away_rating['injury_def_weakness']*100:.0f}%")
+            ppy_model.log_prediction(ppy_state, odds_event["id"], home_team, away_team,
+                                      odds_event["commence_time"], checkpoint_label, proj)
         else:
             lines.append("(Not enough game data yet for a model projection)")
+        ppy_model.grade_predictions(ppy_state)
     except Exception as e:
         print("ppy model failed:", e)
         lines.append("(Model projection failed — send me the Railway log)")
 
     try:
-        away_inj = fetch_team_injuries(odds_event["away_team"])
-        home_inj = fetch_team_injuries(odds_event["home_team"])
         notable = [p for p in away_inj + home_inj if p["status"] in ("Out", "Doubtful")]
         if notable:
             lines.append("Injuries: " + ", ".join(f"{p['name']} ({p['status']})" for p in notable))
     except Exception as e:
-        print("injury fetch failed:", e)
+        print("injury summary failed:", e)
 
     save_state(state)
     await bot.send_message(chat_id=config.TELEGRAM_CHAT_ID, text="\n".join(lines), parse_mode="Markdown")
@@ -125,6 +143,32 @@ async def cmd_status(update, context):
 
 async def cmd_whoami(update, context):
     await update.message.reply_text(f"This chat's ID is: {update.effective_chat.id}")
+
+
+async def cmd_accuracy(update, context):
+    state = load_state()
+    ppy_state = state.setdefault("ppy", {})
+    ppy_model.grade_predictions(ppy_state)
+    save_state(state)
+
+    summary = ppy_model.accuracy_summary(ppy_state)
+    if not summary:
+        await update.message.reply_text("No graded predictions yet — check back after some games complete.")
+        return
+
+    lines = [
+        f"Graded predictions: {summary['n']}",
+        f"Model avg error: {summary['avg_model_error']} pts  |  "
+        f"Market avg error: {summary['avg_market_error']} pts",
+        f"Model beat market: {summary['beat_market_pct']}% of games",
+    ]
+    if summary["signal_count"]:
+        lines.append(f"Signal record: {summary['signal_wins']}-"
+                     f"{summary['signal_count'] - summary['signal_wins']} "
+                     f"({summary['signal_win_pct']}%)")
+    else:
+        lines.append("No graded SIGNAL bets yet.")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_games(update, context):
@@ -191,6 +235,7 @@ def main():
     app.add_handler(CommandHandler("games", cmd_games))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
+    app.add_handler(CommandHandler("accuracy", cmd_accuracy))
     threading.Thread(target=_start_health_server, daemon=True).start()
     app.run_polling()
 
