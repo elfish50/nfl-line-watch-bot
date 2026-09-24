@@ -127,7 +127,8 @@ def update_team_log(ppy_state, team_name, season):
 
         box = _fetch_boxscore_team_stats(game_id)
         team_stats = box.get(espn_id)
-        opp_stats = next((v for k, v in box.items() if k != espn_id), None)
+        opp_espn_id = next((k for k in box if k != espn_id), None)
+        opp_stats = box.get(opp_espn_id) if opp_espn_id else None
         if not team_stats or not opp_stats:
             continue
 
@@ -139,6 +140,7 @@ def update_team_log(ppy_state, team_name, season):
             "yards_gained": team_stats["yards"],
             "points_allowed": opp_stats["points"],
             "yards_allowed": opp_stats["yards"],
+            "opp_espn_id": opp_espn_id,
         })
 
     team_log["games"].sort(key=lambda g: g["week"])
@@ -330,3 +332,170 @@ def format_signal_line(proj, home_team, away_team):
         f"(market {proj['market_spread']:+.1f}) — "
         f"{abs(proj['discrepancy']):.1f} pt gap [{flag}]"
     )
+
+
+# ---------------------------------------------------------------------------
+# Injury adjustment
+# ---------------------------------------------------------------------------
+# Heuristic, not a depth-chart-aware model: every Out/Doubtful/Questionable
+# player at a position in these maps nudges the rating, regardless of
+# whether they're actually a starter or a backup. This will overcorrect for
+# a team that's merely deep at a position and undercorrect for a true
+# season-ending starter loss — MAX_INJURY_DISCOUNT exists specifically to
+# cap how much damage that imprecision can do to a single projection.
+
+OFFENSE_IMPACT = {"QB": 0.15, "RB": 0.05, "WR": 0.04, "TE": 0.03,
+                  "T": 0.03, "G": 0.02, "C": 0.02}
+DEFENSE_IMPACT = {"DE": 0.04, "DT": 0.03, "EDGE": 0.04, "OLB": 0.03,
+                  "ILB": 0.03, "LB": 0.03, "CB": 0.04, "S": 0.03,
+                  "FS": 0.03, "SS": 0.03}
+STATUS_WEIGHT = {"Out": 1.0, "Doubtful": 0.5, "Questionable": 0.15}
+MAX_INJURY_DISCOUNT = 0.20  # cap on how much a single unit's rating can move
+
+
+def compute_injury_impact(players):
+    """
+    players: list of {"name", "position", "status"} dicts, e.g. from
+    injuries.fetch_team_injuries(). Returns (offense_discount, defense_weakness),
+    each a fraction in [0, MAX_INJURY_DISCOUNT].
+    """
+    off_discount = 0.0
+    def_weakness = 0.0
+    for p in players:
+        pos = (p.get("position") or "").upper()
+        weight = STATUS_WEIGHT.get(p.get("status", ""), 0.0)
+        if weight == 0.0:
+            continue
+        if pos in OFFENSE_IMPACT:
+            off_discount += OFFENSE_IMPACT[pos] * weight
+        elif pos in DEFENSE_IMPACT:
+            def_weakness += DEFENSE_IMPACT[pos] * weight
+    return min(off_discount, MAX_INJURY_DISCOUNT), min(def_weakness, MAX_INJURY_DISCOUNT)
+
+
+def apply_injury_adjustment(rating, players):
+    """
+    Returns a new rating dict with off_ppy discounted and def_ppy_allowed
+    inflated based on this team's own injury list. Missing offensive
+    starters lower how many points this team's yards convert to; missing
+    defensive starters raise how many points this team's defense gives up
+    per yard.
+    """
+    off_discount, def_weakness = compute_injury_impact(players)
+    adjusted = dict(rating)
+    adjusted["off_ppy"] = rating["off_ppy"] * (1 - off_discount)
+    adjusted["def_ppy_allowed"] = rating["def_ppy_allowed"] * (1 + def_weakness)
+    adjusted["injury_off_discount"] = off_discount
+    adjusted["injury_def_weakness"] = def_weakness
+    return adjusted
+
+
+# ---------------------------------------------------------------------------
+# Self-tracking / backtesting
+# ---------------------------------------------------------------------------
+# Every check logs (or re-logs, overwriting with the latest checkpoint) the
+# model's prediction for a game. Once update_team_log() has picked up that
+# game's final boxscore (i.e. after it's been played and a later /check or
+# scheduled job runs for either team), grade_predictions() matches the log
+# entry to the completed game by opponent ESPN id and scores the model
+# against what actually happened — and against the market line it was
+# compared to, so you can see whether the model is actually adding
+# anything beyond just trusting Vegas.
+
+def log_prediction(ppy_state, game_id, home_team, away_team, commence_time,
+                    checkpoint_label, proj):
+    """game_id here is The Odds API's event id — stable across the T-60/30/10
+    checks for the same game, so later checks overwrite earlier ones rather
+    than creating duplicates."""
+    log = ppy_state.setdefault("predictions", {})
+    log[game_id] = {
+        "home_team": home_team,
+        "away_team": away_team,
+        "commence_time": commence_time,
+        "last_checkpoint": checkpoint_label,
+        "predicted_spread": proj["predicted_spread"],
+        "market_spread": proj["market_spread"],
+        "discrepancy": proj["discrepancy"],
+        "is_signal": proj["is_signal"],
+        "graded": log.get(game_id, {}).get("graded", False),
+    }
+
+
+def grade_predictions(ppy_state):
+    """
+    Finds ungraded logged predictions whose game has since completed (by
+    looking for a matching opponent in the home team's current-season game
+    log) and grades them in place. Returns the list of newly-graded entries.
+    Assumption: two teams meet at most once in the regular season — true
+    except for the rare case of a team's bye-week reschedule or a
+    same-season rematch, which this will silently skip re-grading on.
+    """
+    newly_graded = []
+    teams = ppy_state.get("teams", {})
+    for game_id, entry in ppy_state.get("predictions", {}).items():
+        if entry.get("graded"):
+            continue
+
+        home_team, away_team = entry["home_team"], entry["away_team"]
+        home_log = teams.get(home_team)
+        away_espn_id = str(ESPN_TEAM_ID.get(away_team, ""))
+        if not home_log or not away_espn_id:
+            continue
+
+        match = next(
+            (g for g in home_log["games"] if g.get("opp_espn_id") == away_espn_id),
+            None,
+        )
+        if not match:
+            continue  # game hasn't completed / been fetched yet
+
+        actual_spread_home = -(match["points_scored"] - match["points_allowed"])
+        model_error = abs(entry["predicted_spread"] - actual_spread_home)
+        market_error = abs(entry["market_spread"] - actual_spread_home)
+
+        signal_result = None
+        if entry["is_signal"]:
+            home_cover_margin = (match["points_scored"] - match["points_allowed"]) + entry["market_spread"]
+            if home_cover_margin == 0:
+                signal_result = "push"
+            elif entry["discrepancy"] < 0:  # model favored home ATS
+                signal_result = "win" if home_cover_margin > 0 else "loss"
+            else:  # model favored away ATS
+                signal_result = "win" if home_cover_margin < 0 else "loss"
+
+        entry.update({
+            "graded": True,
+            "actual_spread_home": actual_spread_home,
+            "model_error": round(model_error, 1),
+            "market_error": round(market_error, 1),
+            "model_beat_market": model_error < market_error,
+            "signal_result": signal_result,
+        })
+        newly_graded.append(entry)
+
+    return newly_graded
+
+
+def accuracy_summary(ppy_state):
+    """Aggregate stats across all graded predictions so far."""
+    graded = [e for e in ppy_state.get("predictions", {}).values() if e.get("graded")]
+    if not graded:
+        return None
+
+    n = len(graded)
+    avg_model_error = sum(e["model_error"] for e in graded) / n
+    avg_market_error = sum(e["market_error"] for e in graded) / n
+    beat_market_count = sum(1 for e in graded if e["model_beat_market"])
+
+    signals = [e for e in graded if e.get("signal_result") in ("win", "loss")]
+    signal_wins = sum(1 for e in signals if e["signal_result"] == "win")
+
+    return {
+        "n": n,
+        "avg_model_error": round(avg_model_error, 2),
+        "avg_market_error": round(avg_market_error, 2),
+        "beat_market_pct": round(100 * beat_market_count / n, 1),
+        "signal_count": len(signals),
+        "signal_wins": signal_wins,
+        "signal_win_pct": round(100 * signal_wins / len(signals), 1) if signals else None,
+    }
