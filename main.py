@@ -148,6 +148,21 @@ async def cmd_whoami(update, context):
 async def cmd_accuracy(update, context):
     state = load_state()
     ppy_state = state.setdefault("ppy", {})
+
+    # Refresh logs for any team with an ungraded prediction, so a completed
+    # game gets picked up even though no future /check happens to touch that
+    # team first — otherwise grading silently waits until the team's next
+    # scheduled matchup.
+    pending_teams = {
+        t for e in ppy_state.get("predictions", {}).values() if not e.get("graded")
+        for t in (e["home_team"], e["away_team"])
+    }
+    for team in pending_teams:
+        try:
+            ppy_model.update_team_log(ppy_state, team, CURRENT_SEASON)
+        except Exception as e:
+            print(f"accuracy refresh failed for {team}:", e)
+
     ppy_model.grade_predictions(ppy_state)
     save_state(state)
 
