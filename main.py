@@ -74,8 +74,10 @@ async def check_game(bot, odds_event, checkpoint_label):
     try:
         ppy_model.update_team_log(ppy_state, home_team, CURRENT_SEASON)
         ppy_model.update_team_log(ppy_state, away_team, CURRENT_SEASON)
-        home_rating = ppy_model.compute_rating(ppy_state, home_team)
-        away_rating = ppy_model.compute_rating(ppy_state, away_team)
+        ppy_model.update_prior_seasons(ppy_state, home_team, CURRENT_SEASON)
+        ppy_model.update_prior_seasons(ppy_state, away_team, CURRENT_SEASON)
+        home_rating = ppy_model.compute_rating(ppy_state, home_team, CURRENT_SEASON)
+        away_rating = ppy_model.compute_rating(ppy_state, away_team, CURRENT_SEASON)
         if home_rating and away_rating and consensus["spread"] is not None:
             proj = ppy_model.project_spread(home_rating, away_rating, consensus["spread"])
             lines.append(ppy_model.format_signal_line(proj, home_team, away_team))
