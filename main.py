@@ -127,13 +127,25 @@ async def refresh_schedule(app):
     now = datetime.now(timezone.utc)
     for ev in events:
         kickoff = datetime.fromisoformat(ev["commence_time"].replace("Z", "+00:00"))
+        if kickoff <= now:
+            continue  # already underway/finished, nothing left to schedule
         for offset in config.CHECK_OFFSETS_MIN:
             run_at = kickoff - timedelta(minutes=offset)
             key = f"{ev['id']}-{offset}"
-            if key in scheduled_keys or run_at <= now:
+            if key in scheduled_keys:
                 continue
-            scheduler.add_job(check_game, DateTrigger(run_date=run_at),
-                               args=[app.bot, ev, f"T-{offset}min"], id=key, misfire_grace_time=300)
+            if run_at <= now:
+                # This checkpoint's time already passed — most likely the
+                # service restarted between when it should have fired and
+                # this refresh tick. Kickoff hasn't happened yet, so run it
+                # now instead of silently losing the check forever.
+                print(f"[schedule] catching up missed checkpoint {key} (was due {run_at.isoformat()})")
+                scheduler.add_job(check_game, DateTrigger(run_date=now),
+                                   args=[app.bot, ev, f"T-{offset}min (late catch-up)"],
+                                   id=key, misfire_grace_time=300)
+            else:
+                scheduler.add_job(check_game, DateTrigger(run_date=run_at),
+                                   args=[app.bot, ev, f"T-{offset}min"], id=key, misfire_grace_time=300)
             scheduled_keys.add(key)
 
 
