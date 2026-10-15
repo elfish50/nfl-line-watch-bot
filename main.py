@@ -116,17 +116,11 @@ async def check_game(bot, odds_event, checkpoint_label):
 
     save_state(state)
     await bot.send_message(chat_id=config.TELEGRAM_CHAT_ID, text="\n".join(lines), parse_mode="Markdown")
-
-
 async def refresh_schedule(app):
-    try:
-        events = await asyncio.to_thread(fetch_odds, config.ODDS_API_KEY)
-        except Exception as e:
-        print("odds fetch failed:", e)
-        scheduler.add_job(refresh_schedule,
-                          DateTrigger(run_date=datetime.now(timezone.utc) + timedelta(minutes=10)),
-                          args=[app], id="refresh_retry", replace_existing=True)
-        return
+  try:
+           events = await asyncio.to_thread(fetch_odds, config.ODDS_API_KEY)
+       except Exception as e:
+           print("odds fetch failed:", e)
     now = datetime.now(timezone.utc)
     for ev in events:
         kickoff = datetime.fromisoformat(ev["commence_time"].replace("Z", "+00:00"))
