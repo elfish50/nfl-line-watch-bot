@@ -41,32 +41,102 @@ def _start_health_server():
 def fmt_signed(n):
     if n is None:
         return "—"
+    n = round(n, 2)
     return f"{'+' if n > 0 else ''}{n}"
 
 
+# ---------------------------------------------------------------------------
+# State: load the Railway env var ONCE and keep it in memory. os.environ never
+# changes inside a running container, so calling load_state() on every check
+# kept handing back the startup copy and threw away every snapshot taken since
+# — that's why the spread never showed any movement.
+# ---------------------------------------------------------------------------
+_state = None
+
+
+def get_state():
+    global _state
+    if _state is None:
+        _state = load_state()
+    return _state
+
+
+MX_TZ = timezone(timedelta(hours=-6))   # Mexico City (no DST since 2022)
+MAX_HISTORY = 30                        # line changes kept per game (opening line always kept)
+PRUNE_AFTER_DAYS = 3                    # drop finished games from state after this
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+
+
+def _fmt_time(iso):
+    if not iso:
+        return "earlier"
+    dt = datetime.strptime(iso, "%Y-%m-%dT%H:%MZ").replace(tzinfo=timezone.utc).astimezone(MX_TZ)
+    return dt.strftime("%a %d/%m %H:%M")
+
+
+def record_snapshot(games_state, ev, consensus):
+    """Adds a line snapshot for this game if spread or total changed.
+    Returns True if something new was stored."""
+    g = games_state.setdefault(ev["id"], {"history": []})
+    g["kickoff"] = ev["commence_time"]
+    g["teams"] = f"{ev['away_team']} @ {ev['home_team']}"
+    hist = g["history"]
+    if hist and hist[-1].get("spread") == consensus["spread"] and hist[-1].get("total") == consensus["total"]:
+        return False
+    hist.append({"t": _now_iso(), "spread": consensus["spread"], "total": consensus["total"]})
+    if len(hist) > MAX_HISTORY:
+        g["history"] = [hist[0]] + hist[-(MAX_HISTORY - 1):]
+    return True
+
+
+def prune_finished(games_state, live_ids):
+    """Removes games that are no longer in the odds feed and kicked off days ago."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=PRUNE_AFTER_DAYS)
+    removed = False
+    for gid in list(games_state.keys()):
+        if gid in live_ids:
+            continue
+        ko = games_state[gid].get("kickoff")
+        if not ko or datetime.fromisoformat(ko.replace("Z", "+00:00")) < cutoff:
+            del games_state[gid]
+            removed = True
+    return removed
+
+
+def movement_line(label, key, current, hist, prev):
+    """'Spread: -3.5 | opened -2.5 (Mon 12/10 09:00) → week -1.0 | since Thu 15/10 13:00: -0.5'"""
+    text = f"{label}: {fmt_signed(current) if key == 'spread' else (current if current is not None else '—')}"
+    opening = next((s for s in hist if s.get(key) is not None), None)
+    if current is None or opening is None:
+        return text
+    if len(hist) == 1:
+        return text + " | first snapshot — week tracking starts now"
+    op_val = opening[key]
+    op_shown = fmt_signed(op_val) if key == "spread" else op_val
+    text += f" | opened {op_shown} ({_fmt_time(opening.get('t'))}) → week {fmt_signed(current - op_val)}"
+    if prev is not None and prev.get(key) is not None and prev is not opening:
+        text += f" | since {_fmt_time(prev.get('t'))}: {fmt_signed(current - prev[key])}"
+    return text
+
+
 async def check_game(bot, odds_event, checkpoint_label):
-    state = load_state()
+    state = get_state()
     games_state = state.setdefault("games", {})
     gid = odds_event["id"]
-    g_state = games_state.setdefault(gid, {"history": []})
 
     consensus = consensus_for_event(odds_event)
-    g_state["history"].append({"spread": consensus["spread"], "total": consensus["total"]})
-    g_state["history"] = g_state["history"][-10:]
-
-    open_snap = g_state["history"][0]
-    cur_snap = g_state["history"][-1]
-    spread_delta = (cur_snap["spread"] - open_snap["spread"]
-                    if cur_snap["spread"] is not None and open_snap["spread"] is not None else None)
-    total_delta = (cur_snap["total"] - open_snap["total"]
-                   if cur_snap["total"] is not None and open_snap["total"] is not None else None)
+    prev_hist = games_state.get(gid, {}).get("history", [])
+    prev = prev_hist[-1] if prev_hist else None
+    record_snapshot(games_state, odds_event, consensus)
+    hist = games_state[gid]["history"]
 
     lines = [
         f"*{odds_event['away_team']} @ {odds_event['home_team']}* — {checkpoint_label}",
-        f"Spread: {fmt_signed(consensus['spread'])}"
-        + (f" (moved {fmt_signed(spread_delta)} since first check)" if spread_delta else ""),
-        f"Total: {consensus['total']}"
-        + (f" (moved {fmt_signed(total_delta)} since first check)" if total_delta else ""),
+        movement_line("Spread", "spread", consensus["spread"], hist, prev),
+        movement_line("Total", "total", consensus["total"], hist, prev),
     ]
 
     away_team, home_team = odds_event["away_team"], odds_event["home_team"]
@@ -116,11 +186,44 @@ async def check_game(bot, odds_event, checkpoint_label):
 
     save_state(state)
     await bot.send_message(chat_id=config.TELEGRAM_CHAT_ID, text="\n".join(lines), parse_mode="Markdown")
+
+
+async def scheduled_check(bot, event_id, fallback_ev, checkpoint_label):
+    """T-60/30/10 jobs: pull LIVE odds at fire time. Before, the job reused the
+    odds captured at the last 6-hour refresh, so the alert showed a stale line."""
+    ev = None
+    try:
+        events = await asyncio.to_thread(fetch_odds, config.ODDS_API_KEY)
+        ev = next((e for e in events if e["id"] == event_id), None)
+    except Exception as e:
+        print("live odds fetch for scheduled check failed:", e)
+    if ev is None:
+        ev = fallback_ev
+        checkpoint_label += " (⚠️ live odds unavailable, line from last refresh)"
+    await check_game(bot, ev, checkpoint_label)
+
+
 async def refresh_schedule(app):
-  try:
-           events = await asyncio.to_thread(fetch_odds, config.ODDS_API_KEY)
-       except Exception as e:
-           print("odds fetch failed:", e)
+    try:
+        events = await asyncio.to_thread(fetch_odds, config.ODDS_API_KEY)
+    except Exception as e:
+        print("odds fetch failed:", e)
+        scheduler.add_job(refresh_schedule,
+                          DateTrigger(run_date=datetime.now(timezone.utc) + timedelta(minutes=10)),
+                          args=[app], id="refresh_retry", replace_existing=True)
+        return
+
+    # Snapshot every game's line on each refresh, so movement is tracked
+    # all week long instead of only during the last hour before kickoff.
+    state = get_state()
+    games_state = state.setdefault("games", {})
+    changed = False
+    for ev in events:
+        changed |= record_snapshot(games_state, ev, consensus_for_event(ev))
+    changed |= prune_finished(games_state, {ev["id"] for ev in events})
+    if changed:
+        save_state(state)
+
     now = datetime.now(timezone.utc)
     for ev in events:
         kickoff = datetime.fromisoformat(ev["commence_time"].replace("Z", "+00:00"))
@@ -137,12 +240,13 @@ async def refresh_schedule(app):
                 # this refresh tick. Kickoff hasn't happened yet, so run it
                 # now instead of silently losing the check forever.
                 print(f"[schedule] catching up missed checkpoint {key} (was due {run_at.isoformat()})")
-                scheduler.add_job(check_game, DateTrigger(run_date=now),
-                                   args=[app.bot, ev, f"T-{offset}min (late catch-up)"],
+                scheduler.add_job(scheduled_check, DateTrigger(run_date=now),
+                                   args=[app.bot, ev["id"], ev, f"T-{offset}min (late catch-up)"],
                                    id=key, misfire_grace_time=300)
             else:
-                scheduler.add_job(check_game, DateTrigger(run_date=run_at),
-                                   args=[app.bot, ev, f"T-{offset}min"], id=key, misfire_grace_time=300)
+                scheduler.add_job(scheduled_check, DateTrigger(run_date=run_at),
+                                   args=[app.bot, ev["id"], ev, f"T-{offset}min"],
+                                   id=key, misfire_grace_time=300)
             scheduled_keys.add(key)
 
 
@@ -155,7 +259,7 @@ async def cmd_whoami(update, context):
 
 
 async def cmd_accuracy(update, context):
-    state = load_state()
+    state = get_state()
     ppy_state = state.setdefault("ppy", {})
 
     # Refresh logs for any team with an ungraded prediction, so a completed
