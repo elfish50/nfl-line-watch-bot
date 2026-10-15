@@ -121,8 +121,11 @@ async def check_game(bot, odds_event, checkpoint_label):
 async def refresh_schedule(app):
     try:
         events = await asyncio.to_thread(fetch_odds, config.ODDS_API_KEY)
-    except Exception as e:
+        except Exception as e:
         print("odds fetch failed:", e)
+        scheduler.add_job(refresh_schedule,
+                          DateTrigger(run_date=datetime.now(timezone.utc) + timedelta(minutes=10)),
+                          args=[app], id="refresh_retry", replace_existing=True)
         return
     now = datetime.now(timezone.utc)
     for ev in events:
